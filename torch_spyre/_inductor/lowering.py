@@ -651,6 +651,35 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.aten.any.default)
+@register_spyre_lowering(torch.ops.aten.any.dim)
+@register_spyre_lowering(torch.ops.aten.any.out)
+def reduce_any(x, dim=None, keepdim=False, *, out=None):
+    x_abs = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops.abs(x.make_loader()(index)),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    x_abs.realize()
+
+    kwargs = lowering._make_reduction_inner(
+        x_abs,
+        axis=dim,
+        keepdims=keepdim,
+        dtype=x.get_dtype(),
+        override_return_dtype=torch.bool,
+    )
+    result = SpyreReduction.create(
+        reduction_type="max", input_node=x_abs, op_info={}, **kwargs
+    )
+    result.realize()
+
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mean.default)
 def lower_mean_default(x, *, dtype=None):
     axis = list(range(len(x.get_size())))
