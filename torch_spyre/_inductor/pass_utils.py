@@ -837,7 +837,13 @@ def _per_core_view_on_buf(
     has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
     splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
     for sym, split in per_sym.items():
-        host_stride = int(dep.index.coeff(sym))
+        coeff = dep.index.coeff(sym)
+        if coeff.free_symbols:
+            result = empty_view
+            if cache is not None:
+                cache[key] = result
+            return result
+        host_stride = int(coeff)
         if split <= 1 or host_stride == 0:
             continue
         splits_by_stride[host_stride] = (int(split), sym)
