@@ -581,6 +581,25 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       const std::vector<at::Tensor>& tensors,
       const std::vector<SymbolicArg>& symbolic_args);
 
+  /**
+   * @brief Invalidate the host-compute address cache.
+   *
+   * Forces the next construct() call to re-run processComputeOnHostCommand
+   * even if the resolved addresses haven't changed.  Useful when external
+   * state (e.g. HCM metadata) is known to have changed, or for testing.
+   */
+  void resetHcCache() const {
+    hc_cache_valid_ = false;
+    cached_addresses_.clear();
+  }
+
+  /**
+   * @brief Query whether the address cache currently holds a valid entry.
+   */
+  bool isHcCacheValid() const {
+    return hc_cache_valid_;
+  }
+
  private:
   std::unique_ptr<Hcm> hcm_;
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
@@ -589,6 +608,15 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
   // Pre-compiled patch plan for fast execution
   mutable deeptools::FastHcmPatchPlan fast_plan_;
+
+  /**
+   * @brief Address cache to skip redundant host-compute corrections.
+   *
+   * Reuses the persistent output_buffer_ when resolved DMVA addresses
+   * match the previous launch, skipping the expensive host-compute call.
+   */
+  mutable std::vector<int64_t> cached_addresses_;
+  mutable bool hc_cache_valid_ = false;
 };
 
 /**

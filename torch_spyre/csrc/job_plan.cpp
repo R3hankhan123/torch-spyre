@@ -213,10 +213,18 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                 ") does not match compiled symbol count (",
                 hcm_->vdci.inputSym_.size(), ") for this host-compute step");
 
+    if (hc_cache_valid_ && resolved_addresses == cached_addresses_) {
+      launch_host_callback([](void*) {});
+      return;
+    }
+
     launch_host_callback([this, resolved_addresses](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              &resolved_addresses);
     });
+
+    cached_addresses_ = resolved_addresses;
+    hc_cache_valid_ = true;
     return;
   }
 
@@ -233,12 +241,23 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     addresses[addr_idx++] = addr;
   }
 
+  // Cache check: if every resolved DMVA address matches the previous
+  // launch, the correction blob in output_buffer_ is still valid.
+  // We still launch a no-op callback to preserve the HostCompute→H2D→Compute
+  if (hc_cache_valid_ && addresses == cached_addresses_) {
+    launch_host_callback([](void*) {});
+    return;
+  }
+
   launch_host_callback([this, addresses](void*) {
     // Use fast path with all tensor addresses
     // Returns true if fast path was actually used, false if fell back
     bool used_fast_path = deeptools::processComputeOnHostCommandFast(
         fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
   });
+
+  cached_addresses_ = std::move(addresses);
+  hc_cache_valid_ = true;
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
@@ -255,6 +274,8 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
        << fast_plan_.num_input_symbols << " input symbols, "
        << fast_plan_.output_size << " bytes output\n";
   }
+  os << "    Address cache: " << (hc_cache_valid_ ? "valid" : "empty") << " ("
+     << cached_addresses_.size() << " entries)\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }

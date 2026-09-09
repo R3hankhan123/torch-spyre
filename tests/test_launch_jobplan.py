@@ -376,3 +376,107 @@ class TestSymbolicArg(TestCase):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestHcCache(TestCase):
+    """Tests for the HostCompute address cache."""
+
+    def test_fresh_plan_cache_is_invalid(self):
+        """Freshly prepared plan has cache_valid=False."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            info = job_plan.get_hc_cache_info()
+            assert len(info) == 1, "plan has exactly one HostCompute step"
+            assert info[0]["step_index"] == 0
+            assert info[0]["cache_valid"] is False
+
+    def test_no_hostcompute_returns_empty_cache_info(self):
+        """Plan without HostCompute returns empty cache info."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            info = job_plan.get_hc_cache_info()
+            assert info == [], "pure-Compute plan has no HostCompute steps"
+
+    def test_reset_hc_caches_clears_all_steps(self):
+        """reset_hc_caches() invalidates every HostCompute step."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            job_plan.reset_hc_caches()
+
+            info = job_plan.get_hc_cache_info()
+            assert len(info) == 1
+            assert info[0]["cache_valid"] is False
+
+    def test_reset_hc_caches_noop_without_hostcompute(self):
+        """reset_hc_caches() is safe on plans without HostCompute."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            job_plan.reset_hc_caches()
+            assert job_plan.get_hc_cache_info() == []
+
+    def test_cache_populated_after_compiled_launch(self):
+        """Two identical compiled launches produce correct results (cache hit)."""
+        torch._dynamo.reset()
+
+        op_fn = torch.abs
+        torch.manual_seed(42)
+        x_cpu = torch.randn(64, dtype=torch.float16)
+        cpu_result = op_fn(x_cpu)
+
+        compiled_fn = torch.compile(op_fn, backend="inductor")
+        x_spyre = x_cpu.to("spyre")
+
+        # First launch — populates cache
+        result1 = compiled_fn(x_spyre).cpu()
+        torch.testing.assert_close(result1, cpu_result, atol=0.1, rtol=0.1)
+
+        # Second launch — same tensor addresses, should hit cache
+        result2 = compiled_fn(x_spyre).cpu()
+        torch.testing.assert_close(
+            result2,
+            cpu_result,
+            atol=0.1,
+            rtol=0.1,
+            msg="cached correction must produce identical results",
+        )
+
+    def test_cache_correctness_across_different_inputs(self):
+        """Same addresses with new data still produces correct output."""
+        torch._dynamo.reset()
+
+        op_fn = torch.abs
+        compiled_fn = torch.compile(op_fn, backend="inductor")
+
+        torch.manual_seed(42)
+        x_spyre = torch.randn(64, dtype=torch.float16).to("spyre")
+        compiled_fn(x_spyre)
+
+        # Overwrite the same device buffer with different values
+        x_cpu_new = torch.randn(64, dtype=torch.float16)
+        x_spyre.copy_(x_cpu_new.to("spyre"))
+
+        result2 = compiled_fn(x_spyre).cpu()
+        expected = torch.abs(x_cpu_new)
+        torch.testing.assert_close(
+            result2,
+            expected,
+            atol=0.1,
+            rtol=0.1,
+            msg="cache hit with new data must still produce correct output",
+        )

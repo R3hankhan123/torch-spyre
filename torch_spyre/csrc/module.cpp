@@ -570,15 +570,52 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the profiler-visible name for a compute step, or None")
-      .def("__repr__", [](const spyre::JobPlan& plan) {
-        return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
-               " job_allocation_size=" +
-               std::to_string(plan.job_allocation.at(0).total_size()) +
-               " expected_inputs=" +
-               std::to_string(plan.expected_input_shapes.size()) +
-               " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
-               ">";
-      });
+      .def("__repr__",
+           [](const spyre::JobPlan& plan) {
+             return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
+                    " job_allocation_size=" +
+                    std::to_string(plan.job_allocation.at(0).total_size()) +
+                    " expected_inputs=" +
+                    std::to_string(plan.expected_input_shapes.size()) +
+                    " pinned_buffers=" +
+                    std::to_string(plan.pinned_buffers.size()) + ">";
+           })
+      .def(
+          "reset_hc_caches",
+          [](const spyre::JobPlan& plan) {
+            for (const auto& step : plan.steps) {
+              const auto* hc =
+                  dynamic_cast<const spyre::JobPlanStepHostCompute*>(
+                      step.get());
+              if (hc != nullptr) {
+                hc->resetHcCache();
+              }
+            }
+          },
+          "Invalidate the address cache on every HostCompute step.\n\n"
+          "Forces the next launch to re-run "
+          "processComputeOnHostCommand[Fast]\n"
+          "even if the resolved addresses haven't changed.")
+      .def(
+          "get_hc_cache_info",
+          [](const spyre::JobPlan& plan) {
+            py::list result;
+            for (size_t i = 0; i < plan.steps.size(); ++i) {
+              const auto* hc =
+                  dynamic_cast<const spyre::JobPlanStepHostCompute*>(
+                      plan.steps[i].get());
+              if (hc != nullptr) {
+                py::dict info;
+                info["step_index"] = i;
+                info["cache_valid"] = hc->isHcCacheValid();
+                result.append(info);
+              }
+            }
+            return result;
+          },
+          "Return per-HostCompute-step cache status.\n\n"
+          "Each entry is a dict with 'step_index' and 'cache_valid' keys.\n"
+          "Useful for verifying the address cache is effective.");
   // Symbolic argument payload types
   py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
       .value("kAddress", spyre::SymbolicArgKind::kAddress)
