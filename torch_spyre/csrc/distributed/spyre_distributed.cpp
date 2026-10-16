@@ -19,10 +19,12 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <flex/flex.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <spyre_comms.hpp>
 #include <spyre_comms_tensor.hpp>
 #include <string>
@@ -39,6 +41,33 @@ namespace spyre {
 
 enum class CollectiveKind { Broadcast, AllGather, AllReduce };
 
+// Identity of an all-reduce run: its plan and the device buffer it binds.
+struct ScheduleKey {
+  int64_t plan_handle;
+  std::vector<CompositeChunkInfo> chunks;
+
+  bool operator==(const ScheduleKey& o) const {
+    return plan_handle == o.plan_handle && chunks == o.chunks;
+  }
+};
+
+struct ScheduleKeyHash {
+  size_t operator()(const ScheduleKey& k) const {
+    size_t h = std::hash<int64_t>()(k.plan_handle);
+    auto mix = [&h](uint64_t v) {
+      h ^= std::hash<uint64_t>()(v) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+           (h >> 2);
+    };
+    for (const auto& c : k.chunks) {
+      mix(c.region_id);
+      mix(c.offset);
+      mix(c.size);
+      mix(c.domain_id);
+    }
+    return h;
+  }
+};
+
 // Structure to hold pending async work
 struct PendingWork {
   CollectiveKind kind;
@@ -51,6 +80,8 @@ struct PendingWork {
   // the wait is skipped so spyre-comms can release it only after the schedule
   // is fully retired.
   std::shared_ptr<void> keep_alive;
+  // Set for an all-reduce: where wait_work returns the schedule for reuse.
+  std::optional<ScheduleKey> reuse_key;
 };
 
 // Build a keep_alive payload that owns a vector of tensors via shared_ptr.
@@ -84,6 +115,98 @@ static void check_collective_errors(spyre_comms::WorkSchedule& work) {
   // successful collective.
   TORCH_CHECK(!spyre::getDefaultStreamRuntimeHandle()->needsShutdown(),
               "[SpyreCCL]: device stream error during collective");
+}
+
+// Reusable all-reduce schedules.
+//
+// A compiled graph runs the same all-reduce plan on the same device buffer
+// every time it executes (each decode step, once per layer), and
+// allreduce_applyTensor rebuilds an identical WorkSchedule for it on each call.
+// Instead, wait_work hands a schedule back here keyed by (plan, buffer
+// address), and the next run on that key restarts it once it has finished.
+struct ReusableSchedule {
+  std::unique_ptr<spyre_comms::WorkSchedule> work;
+  // Holds the buffer while the schedule may still be running; dropped once
+  // query() reports it finished, so the allocator can hand the same address to
+  // the next execution of the graph (which is what makes the key hit again).
+  std::shared_ptr<void> keep_alive;
+};
+
+// Bounds the cache when buffer addresses do not repeat.
+constexpr size_t kMaxReusableSchedules = 4096;
+
+// Leaked on purpose: a WorkSchedule must not be destroyed after
+// finalize_library(), which static destruction at exit could do.
+// release_reusable_schedules() hands them back to spyre-comms before then.
+static auto& reusable_schedules_ =
+    *new std::unordered_map<ScheduleKey, ReusableSchedule, ScheduleKeyHash>();
+static std::mutex reusable_schedules_mutex_;
+static std::atomic<int64_t> reused_schedules_{0};
+
+// Hand a schedule to spyre-comms to retire, without an inline wait().
+static void relinquish(ReusableSchedule&& entry) {
+  if (!entry.work) return;
+  auto keep_alive = entry.keep_alive ? std::move(entry.keep_alive)
+                                     : make_tensor_keep_alive({});
+  spyre_comms::relinquish_work_schedule(std::move(entry.work),
+                                        std::move(keep_alive));
+}
+
+// Release the buffers of finished schedules. Must hold
+// reusable_schedules_mutex_.
+static void drop_finished_keep_alives() {
+  for (auto& [key, entry] : reusable_schedules_) {
+    if (entry.keep_alive && entry.work->query()) {
+      entry.keep_alive.reset();
+    }
+  }
+}
+
+// Take a finished schedule for `key`, or nullptr when there is none to reuse.
+static std::unique_ptr<spyre_comms::WorkSchedule> take_reusable_schedule(
+    const ScheduleKey& key) {
+  std::lock_guard<std::mutex> lock(reusable_schedules_mutex_);
+  auto it = reusable_schedules_.find(key);
+  if (it == reusable_schedules_.end() || !it->second.work->query()) {
+    return nullptr;
+  }
+  // Out of the cache first: a failed schedule must not be offered again.
+  auto work = std::move(it->second.work);
+  reusable_schedules_.erase(it);
+  check_collective_errors(*work);
+  ++reused_schedules_;
+  return work;
+}
+
+// Runs that restarted a kept schedule instead of building one; for tests.
+int64_t spyre_allreduce_schedule_reuses_impl() {
+  return reused_schedules_.load();
+}
+
+static void return_reusable_schedule(ScheduleKey key, ReusableSchedule entry) {
+  std::lock_guard<std::mutex> lock(reusable_schedules_mutex_);
+  drop_finished_keep_alives();
+  auto it = reusable_schedules_.find(key);
+  if (it != reusable_schedules_.end()) {
+    // A second schedule was built for this key while the first still ran.
+    relinquish(std::move(it->second));
+    it->second = std::move(entry);
+    return;
+  }
+  if (reusable_schedules_.size() >= kMaxReusableSchedules) {
+    auto victim = reusable_schedules_.begin();
+    relinquish(std::move(victim->second));
+    reusable_schedules_.erase(victim);
+  }
+  reusable_schedules_.emplace(std::move(key), std::move(entry));
+}
+
+void release_reusable_schedules() {
+  std::lock_guard<std::mutex> lock(reusable_schedules_mutex_);
+  for (auto& [key, entry] : reusable_schedules_) {
+    relinquish(std::move(entry));
+  }
+  reusable_schedules_.clear();
 }
 
 // Compile-time plan cache.
@@ -414,9 +537,14 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
                                    input.storage().data_ptr().get());
   inout_tensor.SetSpyreDeviceAddressBorrowed(get_composite_address(input));
 
-  auto work_schedule = context->allreduce_applyTensor(*plan.wsi, inout_tensor);
-  TORCH_CHECK(work_schedule != nullptr,
-              "allreduce_applyTensor operation failed to create WorkSchedule");
+  ScheduleKey key{plan_handle, CompositeAddressHandle(input).chunks()};
+  auto work_schedule = take_reusable_schedule(key);
+  if (work_schedule == nullptr) {
+    work_schedule = context->allreduce_applyTensor(*plan.wsi, inout_tensor);
+    TORCH_CHECK(
+        work_schedule != nullptr,
+        "allreduce_applyTensor operation failed to create WorkSchedule");
+  }
 
   work_schedule->start();
 
@@ -435,7 +563,8 @@ at::Tensor spyre_allreduce_run_impl(const at::Tensor& input,
                                                {input},
                                                0,
                                                {input},
-                                               std::move(ka)});
+                                               std::move(ka),
+                                               std::move(key)});
   }
 
   return input;
@@ -563,6 +692,19 @@ at::Tensor spyre_wait_work_impl(const at::Tensor& tensor) {
       pending.work->wait();
       check_collective_errors(*pending.work);
       SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait completed";
+      if (pending.reuse_key) {
+        return_reusable_schedule(std::move(*pending.reuse_key),
+                                 {std::move(pending.work), nullptr});
+      }
+    } else if (pending.reuse_key) {
+      // Kept for the next run on this buffer rather than retired. The cache
+      // owns it now, so ~WorkSchedule() never forces an inline wait(), and the
+      // keep_alive holds the buffer until query() reports it finished.
+      check_collective_errors(*pending.work);
+      return_reusable_schedule(
+          std::move(*pending.reuse_key),
+          {std::move(pending.work), std::move(pending.keep_alive)});
+      SPYRE_RUNTIME_DEBUG() << "WorkSchedule wait skipped; kept for reuse";
     } else {
       // If we are skipping the wait, relinquish ownership to spyre-comms so
       // the WorkSchedule stays alive until finalize_library() drains it.
@@ -632,6 +774,8 @@ TORCH_LIBRARY(spyre, m) {
       "allgather_plan(int num_elems, int dtype, int group_size, "
       "str group_name) -> int",
       &spyre::spyre_allgather_plan_impl);
+  m.def("allreduce_schedule_reuses() -> int",
+        &spyre::spyre_allreduce_schedule_reuses_impl);
 
   // Runtime run ops — bind cached WSI to a tensor and execute
   m.def(

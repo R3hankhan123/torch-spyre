@@ -29,6 +29,12 @@
 
 #include "module.h"
 
+namespace spyre {
+// Hands the all-reduce schedules kept for reuse (spyre_distributed.cpp) back to
+// spyre-comms. Called before finalize_library().
+void release_reusable_schedules();
+}  // namespace spyre
+
 namespace c10d {
 
 /***********************************************

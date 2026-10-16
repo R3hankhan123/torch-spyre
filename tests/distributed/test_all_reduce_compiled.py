@@ -219,6 +219,36 @@ class TestAllReduceCompiled(TestCase):
             f"Expected {expected_val}, got {result[0].to('cpu').item()}",
         )
 
+    def test_allreduce_compiled_reuses_schedule_across_calls(self):
+        """Rerunning a graph restarts the all-reduce schedule kept for its buffer,
+        and every run still sums that run's values rather than a stale result."""
+        compiled_module = torch.compile(AllReduceWithComputeModule())
+        before = torch.ops.spyre.allreduce_schedule_reuses()
+
+        for step in range(1, 9):
+            x = torch.full(
+                (128,), float((self.comm_rank + 1) * step), dtype=torch.float16
+            ).to(DEVICE)
+            y = torch.zeros((128,), dtype=torch.float16).to(DEVICE)
+            result = compiled_module(x, y)
+
+            # 2x summed over ranks: 2 * step * (1 + ... + world_size), plus y + 1.
+            expected_val = step * self.comm_size * (self.comm_size + 1) + 1.0
+            expected = torch.full((128,), expected_val, dtype=torch.float16)
+            torch.testing.assert_close(
+                result.cpu(),
+                expected,
+                atol=0,
+                rtol=0,
+                msg=f"Rank {self.comm_rank}: call {step} incorrect",
+            )
+
+        self.assertGreater(
+            torch.ops.spyre.allreduce_schedule_reuses() - before,
+            0,
+            "no run restarted a kept schedule; the buffer address never repeated",
+        )
+
     def test_allreduce_compiled_sequential_same_shape(self):
         """Two sequential allreduce calls on the same tensor shape in one graph."""
 

@@ -342,6 +342,13 @@ finishes. Set `TORCH_SPYRE_DIST_ENFORCE_WAIT=1` to enforce that wait;
 when unset the wait is skipped and ordering relies on the
 default stream, where `spyre_comms` runs every collective.
 
+A compiled all-reduce runs the same plan on the same device buffer each time
+its graph executes. `wait_work` therefore keeps the finished `WorkSchedule`
+keyed by plan and buffer address, and the next `allreduce_run` on that key
+restarts it instead of rebuilding it with `allreduce_applyTensor`. The buffer is
+held only until the schedule finishes. Kept schedules are relinquished to
+`spyre_comms` before `finalize_library()`.
+
 ## More in This Section
 
 ```{toctree}
