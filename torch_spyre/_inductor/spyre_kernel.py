@@ -378,10 +378,19 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=False):
         # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
         # Spyre maps directly to fixed hardware ops via DtypeOpTable and
         # cannot honor compute-type promotion, so accept and ignore.
+        if src_dtype is None:
+            # Only make_pointwise's precision-cast emulation omits src_dtype: a
+            # downcast/upcast pair to the value's own low-precision dtype. It
+            # is active whenever a pointwise result is saved for backward
+            # (emulate_precision_casts_on_saved_tensors, on by default). Spyre
+            # computes float16 natively, so the pair is the identity.
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise Unsupported(f"conversion to {dtype} without a source dtype")
+            return x
         assert dtype != src_dtype
 
         if src_dtype == torch.bool:

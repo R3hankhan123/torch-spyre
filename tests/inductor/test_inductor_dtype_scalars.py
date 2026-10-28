@@ -892,3 +892,18 @@ class TestNegativeScalarOperations:
         )
         expected = x + torch.ones_like(x)
         assert torch.allclose(result.cpu(), expected, atol=0.1, rtol=0.1)
+
+
+def test_precision_cast_emulation_compiles():
+    """float16 pointwise under inductor's eager-precision emulation.
+
+    Emulation wraps each float16 pointwise in a downcast/upcast ``to_dtype`` pair
+    that carries no ``src_dtype``. ``emulate_precision_casts_on_saved_tensors``,
+    on by default, does the same for a result saved for backward.
+    """
+
+    def fn(x):
+        return (x * x + x).mean(-1, keepdim=True)
+
+    with torch._inductor.config.patch(emulate_precision_casts=True):
+        compare_with_cpu(fn, cached_randn((8, 128)), run_eager=False)
